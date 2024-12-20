@@ -1,135 +1,181 @@
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const jwt = require('jsonwebtoken');
-const bodyParser = require('body-parser');
-const cookieParser = require('cookie-parser');
 require('dotenv').config();
+const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
+const helmet = require('helmet');
+const morgan = require('morgan');
 
 const port = process.env.PORT || 9000;
 const app = express();
 
 // Middleware
 app.use(cors({
-  origin: 'http://localhost:5173', // Ensure the frontend URL is correct
+  origin: ['http://localhost:5173'],
   credentials: true,
 }));
 app.use(express.json());
-app.use(bodyParser.json());
 app.use(cookieParser());
+app.use(helmet());
+app.use(morgan('dev'));
 
-// MongoDB credentials and connection URI
-const dbUser = process.env.DB_USER;
-const dbPass = process.env.DB_PASS;
-const dbName = process.env.DB_NAME;
-const SecritKey = process.env.SECRET_KEY;
-
-const uri = `mongodb+srv://${dbUser}:${dbPass}@cluster0.vankq.mongodb.net/${dbName}?retryWrites=true&w=majority`;
-
-
+// MongoDB connection
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@main.yolij.mongodb.net/?retryWrites=true&w=majority&appName=Main`;
 const client = new MongoClient(uri, {
-  serverApi: ServerApiVersion.v1,
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  },
 });
 
-// Verify Token middleware
+// Middleware for verifying JWT
 const verifyToken = (req, res, next) => {
-  const token = req.cookies.token;
-  if (!token) {
-    return res.status(401).send('Unauthorized');
-  }
+  const token = req.cookies?.token;
+  // if (!token) return res.status(401).send({ message: 'Unauthorized access' });
 
-  jwt.verify(token, SecritKey, (err, decoded) => {
-    if (err) {
-      return res.status(401).send('Unauthorized');
-    }
-
-    req.user = decoded;
-    next();
-  });
-};
-
-app.use((req, res, next) => {
-  console.log(`Received request at ${req.method} ${req.url}`);
+  // jwt.verify(token, process.env.SECRET_KEY, (err, decoded) => {
+  //   if (err) return res.status(401).send({ message: 'Unauthorized access' });
+  //   req.user = decoded;
+  //   next();
+  // });
   next();
-});
+};
 
 async function run() {
   try {
     await client.connect();
-    console.log('Connected to MongoDB');
+    const db = client.db(process.env.DB_NAME);
+    const jobsCollection = db.collection('Jobs');
+    const bidsCollection = db.collection('Bids');
 
-    const jobsCollection = client.db(dbName).collection('Jobs');
-
-    // Route to handle JWT creation and cookie setting
+    // Generate JWT
     app.post('/jwt', async (req, res) => {
-      const user = req.body;
-      if (!user.email) {
-        return res.status(400).send({ error: 'Email is required' });
-      }
-
-      const token = jwt.sign(user, SecritKey, { expiresIn: '1h' });
+      const email = req.body;
+      const token = jwt.sign(email, process.env.SECRET_KEY, { expiresIn: '365d' });
       res
         .cookie('token', token, {
           httpOnly: true,
-          secure: process.env.NODE_ENV === 'production', // Use secure cookies in production
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'strict',
         })
-        .send({ success: true, token });
+        .send({ success: true });
     });
 
-    // Route for posting jobs (protected by verifyToken)
-    app.post('/jobs', verifyToken, async (req, res) => {
+    // Logout
+    app.get('/logout', (req, res) => {
+      res
+        .clearCookie('token', {
+          maxAge: 0,
+          secure: process.env.NODE_ENV === 'production',
+          sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'strict',
+        })
+        .send({ success: true });
+    });
+
+    // Add a job
+    app.post('/add-job', async (req, res) => {
       const jobData = req.body;
-      try {
-        const result = await jobsCollection.insertOne(jobData);
-        res.status(201).send(result);
-      } catch (error) {
-        res.status(500).send({ error: 'Failed to add job' });
-      }
+      const result = await jobsCollection.insertOne(jobData);
+      res.send(result);
     });
 
-    // Route to get all jobs
+    // Get all jobs
     app.get('/jobs', async (req, res) => {
-      try {
-        const jobs = await jobsCollection.find().toArray();
-        res.send(jobs);
-      } catch (error) {
-        res.status(500).send({ error: 'Failed to fetch jobs' });
-      }
+      const jobs = await jobsCollection.find().toArray();
+      res.send(jobs);
+    });
+    
+
+    // Get jobs posted by a specific user
+    app.get('/jobs/:email', verifyToken, async (req, res) => {
+      const email = req.params.email;
+      const decodedEmail = req.user?.email;
+      if (decodedEmail !== email)
+        return res.status(401).send({ message: 'Unauthorized access' });
+
+      const query = { 'buyer.email': email };
+      const result = await jobsCollection.find(query).toArray();
+      res.send(result);
     });
 
-    // Get job by ID
-    app.get('/job/:id', async (req, res) => {
-      const { id } = req.params;
-      try {
-        const job = await jobsCollection.findOne({ _id: new ObjectId(id) });
-        res.send(job);
-      } catch (error) {
-        res.status(500).send({ error: 'Failed to fetch job' });
-      }
+    // Delete a job
+    app.delete('/job/:id', verifyToken, async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const result = await jobsCollection.deleteOne(query);
+      res.send(result);
     });
 
-    // Filter jobs by category
-    app.get('/jobs/category/:category', async (req, res) => {
-      const { category } = req.params;
-      try {
-        const jobs = await jobsCollection.find({ category }).toArray();
-        res.send(jobs);
-      } catch (error) {
-        res.status(500).send({ error: 'Failed to fetch jobs by category' });
-      }
+    // Update a job
+    app.put('/update-job/:id', async (req, res) => {
+      const id = req.params.id;
+      const jobData = req.body;
+      const query = { _id: new ObjectId(id) };
+      const updated = { $set: jobData };
+      const options = { upsert: true };
+      const result = await jobsCollection.updateOne(query, updated, options);
+      res.send(result);
     });
 
-  } catch (error) {
-    console.error('MongoDB connection error:', error);
+    // Add a bid
+    app.post('/add-bid', async (req, res) => {
+      const bidData = req.body;
+      const query = { email: bidData.email, jobId: bidData.jobId };
+      const alreadyExist = await bidsCollection.findOne(query);
+
+      if (alreadyExist)
+        return res.status(400).send('You have already placed a bid on this job!');
+
+      const result = await bidsCollection.insertOne(bidData);
+      const filter = { _id: new ObjectId(bidData.jobId) };
+      const update = { $inc: { bid_count: 1 } };
+      await jobsCollection.updateOne(filter, update);
+      res.send(result);
+    });
+
+    // Get bids for a specific user
+    app.get('/bids/:email', verifyToken, async (req, res) => {
+      const isBuyer = req.query.buyer;
+      const email = req.params.email;
+      const decodedEmail = req.user?.email;
+
+      if (decodedEmail !== email)
+        return res.status(401).send({ message: 'Unauthorized access' });
+
+      let query = {};
+      if (isBuyer) {
+        query.buyer = email;
+      } else {
+        query.email = email;
+      }
+
+      const result = await bidsCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    // Update bid status
+    app.patch('/bid-status-update/:id', async (req, res) => {
+      const id = req.params.id;
+      const { status } = req.body;
+
+      const filter = { _id: new ObjectId(id) };
+      const updated = { $set: { status } };
+      const result = await bidsCollection.updateOne(filter, updated);
+      res.send(result);
+    });
+
+    console.log('Connected to MongoDB!');
+  } catch (err) {
+    console.error(err);
   }
 }
 
-run().catch(console.error);
+run().catch(console.dir);
 
-// Test route
 app.get('/', (req, res) => {
-  res.send('Hello from OneSphere Server....');
+  res.send('Hello from SoloSphere Server....');
 });
 
-// Start the server
 app.listen(port, () => console.log(`Server running on port ${port}`));
